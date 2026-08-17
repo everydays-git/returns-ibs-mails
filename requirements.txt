@@ -1,0 +1,6 @@
+google-api-python-client==2.149.0
+google-auth==2.35.0
+google-cloud-bigquery==3.26.0
+google-cloud-secret-manager==2.21.0
+xlrd==2.0.1
+tzdata==2024.2
