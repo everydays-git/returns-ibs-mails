@@ -34,6 +34,7 @@ gcloud services enable \
   cloudbuild.googleapis.com \
   artifactregistry.googleapis.com \
   cloudscheduler.googleapis.com \
+  secretmanager.googleapis.com \
   gmail.googleapis.com \
   iamcredentials.googleapis.com \
   bigquery.googleapis.com
@@ -292,3 +293,127 @@ Legacy-Format (BIFF). Kein Umweg über Drive, keine Konvertierung.
 
 **Geschrieben wird per Ladejob**, nicht per INSERT – das umgeht DML-Kontingente.
 Das Dataset liegt in `EU`, die Jobs laufen entsprechend.
+
+---
+
+## Zweiter Job: Shopify-Anreicherung
+
+Holt zu jedem Retourenfall aus einem der beiden Shopify-Shops die Bestellung:
+Bestellnummer, Kundenemail, Betraege und die Positionen als Momentaufnahme
+(`order_snapshot`) - die Grundlage fuer die spaetere Erstattungsberechnung.
+
+Laeuft auf denselben Tabellen wie der Ingest, aber als eigener Job. Der Ingest
+bleibt unberuehrt.
+
+### Voraussetzung: Client-ID und Secret der Custom App
+
+Seit 2026 gibt Shopify keine kopierbaren Zugriffstoken mehr aus. Stattdessen
+tauscht der Job Client-ID und Client-Secret ueber den Client-Credentials-Grant
+gegen einen Token, der 24 Stunden gilt. Da beide Shops sich dieselbe App
+teilen, gibt es nur **ein** Paar an Zugangsdaten.
+
+1. Im **Dev Dashboard** eine App anlegen (oder die vorhandene nutzen), unter
+   den Admin-API-Scopes `read_orders` und `read_customers` setzen, Version
+   veroeffentlichen.
+2. Unter *Install app* die App in **beiden** Shops installieren.
+3. Unter *Settings* Client-ID und Client-Secret kopieren.
+
+| Shop | Kanal in BigQuery | myshopify-Domain |
+|---|---|---|
+| everydays | `shopify_everydays` | `everydays-besserleben.myshopify.com` |
+| growies | `shopify_growies` | `mnu00s-iz.myshopify.com` |
+
+```bash
+gcloud services enable secretmanager.googleapis.com
+
+# Achtung: gerade Hochkommata verwenden, keine typografischen
+cat > /tmp/shopify-app.json <<'ENDE'
+{"client_id":"HIER_CLIENT_ID","client_secret":"HIER_CLIENT_SECRET"}
+ENDE
+
+gcloud secrets create shopify-app-credentials --data-file=/tmp/shopify-app.json
+rm /tmp/shopify-app.json
+
+gcloud secrets add-iam-policy-binding shopify-app-credentials \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+Zum spaeteren Aktualisieren der Zugangsdaten:
+
+```bash
+gcloud secrets versions add shopify-app-credentials --data-file=/tmp/shopify-app.json
+```
+
+### Deployen
+
+```bash
+cd ~/retouren-ingest
+
+gcloud run jobs deploy retouren-anreicherung \
+  --source . \
+  --region $REGION \
+  --service-account $SA_EMAIL \
+  --command python \
+  --args anreichern.py \
+  --set-env-vars "GCP_PROJECT=${PROJECT_ID},\
+SHOP_EVERYDAYS_DOMAIN=everydays-besserleben.myshopify.com,\
+SHOP_GROWIES_DOMAIN=mnu00s-iz.myshopify.com,\
+SHOPIFY_CREDENTIALS_SECRET=shopify-app-credentials" \
+  --max-retries 1 --task-timeout 30m
+```
+
+### Testlauf ohne Schreibvorgang
+
+```bash
+gcloud run jobs execute retouren-anreicherung --region $REGION --wait \
+  --args="anreichern.py,--modus=test,--limit=5"
+```
+
+Im Log stehen die ersten drei angereicherten Faelle als JSON. Pruefen: Stimmt
+der Bestellname? Passt der Kundenname zum Absender des Belegs? Sind die
+Positionen vollstaendig?
+
+### Vollstaendiger Lauf
+
+```bash
+gcloud run jobs execute retouren-anreicherung --region $REGION --wait \
+  --args="anreichern.py,--limit=500"
+```
+
+### Zeitplan
+
+Nach dem Ingest, damit neue Faelle direkt angereichert werden:
+
+```bash
+gcloud scheduler jobs create http retouren-anreicherung-6h \
+  --location $REGION \
+  --schedule "20 3,9,15,21 * * *" \
+  --time-zone "Europe/Berlin" \
+  --uri "https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/retouren-anreicherung:run" \
+  --http-method POST \
+  --oauth-service-account-email $SA_EMAIL
+```
+
+### Status pruefen
+
+```sql
+SELECT channel, enrichment_status, COUNT(*) AS anzahl
+FROM `academic-arcade-394115.returns.return_cases`
+GROUP BY 1,2 ORDER BY 1,3 DESC;
+
+-- Faelle ohne gefundene Bestellung
+SELECT c.receipt_id, c.channel, c.order_reference, r.sender_name
+FROM `academic-arcade-394115.returns.return_cases` c
+JOIN `academic-arcade-394115.returns.return_receipts` r USING (receipt_id)
+WHERE c.enrichment_status = 'not_found';
+```
+
+### Bekannte Fehlerbilder
+
+| Symptom | Ursache | Abhilfe |
+|---|---|---|
+| Tokentausch schlaegt fehl | App in diesem Shop nicht installiert, oder Client-ID/Secret falsch | Im Dev Dashboard *Install app* pruefen, Secret neu setzen |
+| HTTP 401/403 bei der Abfrage | Scope fehlt oder Version nicht veroeffentlicht | `read_orders` und `read_customers` setzen, Version veroeffentlichen |
+| Alles `not_found` bei einem Shop | falsche myshopify-Domain oder falsches Praefix | Domain pruefen; everydays nutzt `#`, growies `G` |
+| `THROTTLED` im Log | Abfragerate zu hoch | wird automatisch wiederholt; bei Dauerlast `--limit` senken |
