@@ -417,3 +417,117 @@ WHERE c.enrichment_status = 'not_found';
 | HTTP 401/403 bei der Abfrage | Scope fehlt oder Version nicht veroeffentlicht | `read_orders` und `read_customers` setzen, Version veroeffentlichen |
 | Alles `not_found` bei einem Shop | falsche myshopify-Domain oder falsches Praefix | Domain pruefen; everydays nutzt `#`, growies `G` |
 | `THROTTLED` im Log | Abfragerate zu hoch | wird automatisch wiederholt; bei Dauerlast `--limit` senken |
+
+---
+
+## Dritter Job: Stammdaten
+
+Laedt die IBS-Artikelliste und die Billbee-Produkte samt Stuecklisten als
+Tagesschnappschuss nach BigQuery und leitet daraus ab:
+
+- `sku_mapping` - welcher gemeldete SKU-Wert welchem IBS-Artikel entspricht
+  und welche Shopify-SKU dazugehoert
+- `pack_components` - aus welchen Einzelartikeln ein Set besteht
+
+Ohne diese beiden Tabellen laesst sich eine Retoure von "2 Einheiten Artikel
+30016" nicht auf die Shopify-Position abbilden.
+
+### Voraussetzung: zwei Secrets
+
+```bash
+printf '%s' 'IBS_API_KEY_HIER' > /tmp/ibs.txt
+gcloud secrets create ibs-api-key --data-file=/tmp/ibs.txt
+rm /tmp/ibs.txt
+
+cat > /tmp/billbee.json <<'ENDE'
+{"api_key":"HIER_API_KEY","user":"HIER_BENUTZER","password":"HIER_PASSWORT"}
+ENDE
+gcloud secrets create billbee-credentials --data-file=/tmp/billbee.json
+rm /tmp/billbee.json
+
+for s in ibs-api-key billbee-credentials; do
+  gcloud secrets add-iam-policy-binding $s \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/secretmanager.secretAccessor"
+done
+```
+
+### Deployen
+
+```bash
+cd ~/retouren-ingest
+
+gcloud run jobs deploy retouren-stammdaten \
+  --source . \
+  --region $REGION \
+  --service-account $SA_EMAIL \
+  --command python \
+  --args stammdaten.py \
+  --set-env-vars "GCP_PROJECT=${PROJECT_ID},IBS_CLIENT=147,IBS_SECRET=ibs-api-key,BILLBEE_SECRET=billbee-credentials" \
+  --max-retries 1 --task-timeout 20m
+```
+
+### Testlauf ohne Schreibvorgang
+
+```bash
+gcloud run jobs execute retouren-stammdaten --region $REGION --wait \
+  --args="stammdaten.py,--modus=test"
+```
+
+Pruefen: Wie viele IBS-Artikel haben eine Shopify-SKU? Wie viele Sets hat
+Billbee? Steht in der Stuecklisten-Probe `smap-540` mit 3x `smap-180`?
+
+### Vollstaendiger Lauf
+
+```bash
+gcloud run jobs execute retouren-stammdaten --region $REGION --wait \
+  --args="stammdaten.py"
+```
+
+### Zeitplan
+
+Einmal taeglich, vor dem ersten Ingest-Lauf:
+
+```bash
+gcloud scheduler jobs create http retouren-stammdaten-taeglich \
+  --location $REGION \
+  --schedule "40 2 * * *" \
+  --time-zone "Europe/Berlin" \
+  --uri "https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/retouren-stammdaten:run" \
+  --http-method POST \
+  --oauth-service-account-email $SA_EMAIL
+```
+
+### Ergebnis pruefen
+
+```sql
+-- SKU-Werte ohne eindeutige Zuordnung
+SELECT * FROM `academic-arcade-394115.returns.sku_mapping`
+WHERE article_no IS NULL OR is_ambiguous
+ORDER BY sku_reported;
+
+-- Stueckliste eines Sets
+SELECT * FROM `academic-arcade-394115.returns.v_pack_components_by_sku`
+WHERE parent_sku = 'smap-540';
+
+-- Stammdaten-Pruefliste: Sets ohne Stueckliste
+SELECT article_id, sku, title_de
+FROM `academic-arcade-394115.returns.v_billbee_products_current`
+WHERE product_type = 2 AND NOT is_deactivated
+  AND article_id NOT IN (SELECT parent_article_id
+                         FROM `academic-arcade-394115.returns.pack_components`);
+```
+
+### Hinweise
+
+**Wiederholbar:** Ein zweiter Lauf am selben Tag ersetzt den Tagesstand,
+statt ihn zu verdoppeln.
+
+**Manuelle Zuordnungen bleiben erhalten.** Eintraege in `sku_mapping` mit
+`match_method = 'manual'` werden nie ueberschrieben - dort kann eine
+Zuordnung von Hand hinterlegt werden, die der Automatik entgeht.
+
+**Die Aufloesung ist zweistufig:** exakt gegen `article_no`, danach
+numerisch gleich (faengt die fuehrenden Nullen ab, die Excel verliert).
+Eine Praefixsuche ist nicht noetig, weil `article_no` bei IBS auf 18 Zeichen
+begrenzt ist und der gemeldete Wert damit vollstaendig.
