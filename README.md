@@ -531,3 +531,214 @@ Zuordnung von Hand hinterlegt werden, die der Automatik entgeht.
 numerisch gleich (faengt die fuehrenden Nullen ab, die Excel verliert).
 Eine Praefixsuche ist nicht noetig, weil `article_no` bei IBS auf 18 Zeichen
 begrenzt ist und der gemeldete Wert damit vollstaendig.
+
+---
+
+## Vierter Job: Freshdesk-Verknuepfung
+
+Sucht zu jedem Retourenfall die Tickets des Kunden, waehlt eines aus und
+speichert die Alternativen mit. Nur lesend - der Ticketstatus wird in
+Freshdesk gepflegt, das Tool zeigt ihn an.
+
+Die Extraktion der getroffenen Vereinbarung ist bewusst noch nicht Teil
+dieses Jobs. Erst muss belegt sein, dass die Ticketauswahl trifft - eine
+Extraktion aus dem falschen Ticket waere schlechter als keine.
+
+### Voraussetzung: API-Key
+
+In Freshdesk unter *Profileinstellungen* steht der API-Key des Agenten.
+Der Zugriff erfolgt mit dem Key als Benutzername und `X` als Passwort.
+
+```bash
+cat > /tmp/fd.txt << 'ENDE'
+HIER_DEN_FRESHDESK_API_KEY
+ENDE
+tr -d '\n\r' < /tmp/fd.txt > /tmp/fd2.txt && mv /tmp/fd2.txt /tmp/fd.txt
+
+gcloud secrets create freshdesk-api-key --data-file=/tmp/fd.txt
+rm /tmp/fd.txt
+
+gcloud secrets add-iam-policy-binding freshdesk-api-key \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+Vorab pruefen, ob der Key traegt:
+
+```bash
+FD=$(gcloud secrets versions access latest --secret=freshdesk-api-key)
+curl -s -o /dev/null -w "Freshdesk: HTTP %{http_code}\n" \
+  -u "$FD:X" "https://everydays.freshdesk.com/api/v2/tickets?per_page=1"
+```
+
+### Deployen
+
+```bash
+cd ~/retouren-ingest
+
+gcloud run jobs deploy retouren-tickets \
+  --source . \
+  --region $REGION \
+  --service-account $SA_EMAIL \
+  --command python \
+  --args tickets.py \
+  --set-env-vars "GCP_PROJECT=${PROJECT_ID},FRESHDESK_DOMAIN=everydays.freshdesk.com,FRESHDESK_SECRET=freshdesk-api-key" \
+  --max-retries 1 --task-timeout 30m
+```
+
+### Testlauf
+
+```bash
+gcloud run jobs execute retouren-tickets --region $REGION --wait \
+  --args="tickets.py,--modus=test,--limit=10"
+```
+
+Pruefen: Passt der Betreff des gewaehlten Tickets zur Retoure? Liegt das
+Ticket zeitlich vor dem Wareneingang? Wie viele Kandidaten gibt es?
+
+### Zeitplan
+
+Nach der Anreicherung, damit die Kundenemail bereits vorliegt:
+
+```bash
+gcloud scheduler jobs create http retouren-tickets-6h \
+  --location $REGION \
+  --schedule "40 3,9,15,21 * * *" \
+  --time-zone "Europe/Berlin" \
+  --uri "https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/retouren-tickets:run" \
+  --http-method POST \
+  --oauth-service-account-email $SA_EMAIL
+```
+
+### Ergebnis pruefen
+
+```sql
+-- Trefferquote und Auswahlgruende
+SELECT JSON_VALUE(freshdesk_snapshot,'$.auswahlgrund') AS grund,
+       COUNT(*) AS faelle
+FROM `academic-arcade-394115.returns.return_cases`
+WHERE freshdesk_snapshot IS NOT NULL
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Faelle mit mehreren Ticketkandidaten
+SELECT receipt_id, freshdesk_ticket_id, freshdesk_status,
+       SAFE_CAST(JSON_VALUE(freshdesk_snapshot,'$.tickets_gefunden') AS INT64) AS kandidaten
+FROM `academic-arcade-394115.returns.return_cases`
+WHERE SAFE_CAST(JSON_VALUE(freshdesk_snapshot,'$.tickets_gefunden') AS INT64) > 1;
+
+-- Wiedervorlage: seit ueber 7 Tagen auf Kundenantwort wartend
+SELECT receipt_id, freshdesk_ticket_id, freshdesk_status, freshdesk_updated_at
+FROM `academic-arcade-394115.returns.return_cases`
+WHERE status = 'kunde_kontaktiert'
+  AND freshdesk_updated_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY);
+```
+
+### Hinweise
+
+**Statusbezeichnungen kommen aus Freshdesk**, nicht aus einer festen Liste.
+Der Job liest sie einmal je Lauf aus den Ticketfeldern - so erscheint
+"Wartend auf Kundenantwort" im Klartext, ohne dass wir Nummern raten.
+
+**Rueckblick 120 Tage** ab Wareneingang. Ohne `updated_since` liefert die
+API nur Tickets der letzten 30 Tage, was bei spaet eintreffenden Retouren
+zu wenig waere.
+
+**Archivierte Tickets erscheinen nicht** in den Ergebnissen - eine Grenze
+der API, keine Einstellung.
+
+---
+
+## Fuenfter Job: Erstattungsvorschlag
+
+Berechnet je Fall, wie viel erstattet werden kann. Setzt auf der Zuordnung
+(`v_return_lines`) auf und holt die Betraege bei Shopify - nicht aus eigener
+Rechnung.
+
+**Warum Shopify rechnet:** In 79 verglichenen Bestellungen hat sich gezeigt,
+dass sich Rabatte nicht zuverlaessig aus den Positionsfeldern ableiten lassen.
+Mal steckt der Rabatt schon in `discountedTotalSet`, mal nicht - je nachdem,
+ob er auf Positions- oder Bestellebene haengt. Shopify beruecksichtigt
+zusaetzlich Steuern und bereits erfolgte Erstattungen.
+
+### Zwei Wege
+
+| Zuordnung | Vorgehen | Faelle |
+|---|---|---|
+| `position` | ganze Packungen, Shopify liefert den Betrag exakt | 132 |
+| `betrag` | anteilige Packung: Shopifys Wert fuer EINE Packung mal Anteil | 9 |
+
+Der zweite Fall ist der klassische: drei Packungen bestellt als ein `smap-540`,
+zwei zurueckgeschickt. Zwei Drittel einer Position lassen sich als Menge nicht
+ausdruecken - deshalb der Umweg ueber den Wert je Packung.
+
+### Ergebnis
+
+`proposed_refund` traegt den anteiligen Betrag, `refund_options` zusaetzlich:
+
+- `anteilig` - was tatsaechlich zurueckkam
+- `voll` - die betroffene Packung ganz (bei Kulanz oft der richtige Wert)
+- `maximal_erstattbar` - Grenze laut Shopify
+- `grundlage` - wie sich der Betrag zusammensetzt, fuer die Anzeige
+
+### Deployen
+
+```bash
+cd ~/retouren-ingest
+
+gcloud run jobs deploy retouren-erstattung \
+  --source . \
+  --region $REGION \
+  --service-account $SA_EMAIL \
+  --command python \
+  --args erstattung.py \
+  --set-env-vars "GCP_PROJECT=${PROJECT_ID},\
+SHOP_EVERYDAYS_DOMAIN=everydays-besserleben.myshopify.com,\
+SHOP_GROWIES_DOMAIN=mnu00s-iz.myshopify.com,\
+SHOPIFY_CREDENTIALS_SECRET=shopify-app-credentials" \
+  --max-retries 1 --task-timeout 30m
+```
+
+### Testlauf
+
+```bash
+gcloud run jobs execute retouren-erstattung --region $REGION --wait \
+  --args="erstattung.py,--modus=test,--limit=10"
+```
+
+Pruefen: Stimmt bei einem anteiligen Fall das Verhaeltnis? Bei zwei von drei
+Packungen sollte `anteilig` zwei Drittel von `voll` betragen.
+
+### Zeitplan
+
+Nach der Freshdesk-Verknuepfung:
+
+```bash
+gcloud scheduler jobs create http retouren-erstattung-6h \
+  --location $REGION \
+  --schedule "50 3,9,15,21 * * *" \
+  --time-zone "Europe/Berlin" \
+  --uri "https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/retouren-erstattung:run" \
+  --http-method POST \
+  --oauth-service-account-email $SA_EMAIL
+```
+
+### Ergebnis pruefen
+
+```sql
+SELECT receipt_id, shopify_order_name, proposed_refund,
+       SAFE_CAST(JSON_VALUE(refund_options,'$.voll') AS FLOAT64) AS voll,
+       SAFE_CAST(JSON_VALUE(refund_options,'$.maximal_erstattbar') AS FLOAT64) AS maximal
+FROM `academic-arcade-394115.returns.return_cases`
+WHERE proposed_refund IS NOT NULL
+  AND proposed_refund != SAFE_CAST(JSON_VALUE(refund_options,'$.voll') AS FLOAT64)
+ORDER BY proposed_refund DESC;
+```
+
+### Hinweise
+
+**Nichts wird ausgefuehrt.** Der Job berechnet nur. Die Erstattung loest der
+Kundenservice weiterhin in Shopify aus - der Knopf kommt in V2.
+
+**Faelle mit mehreren anteiligen Positionen** werden uebersprungen und
+gemeldet. In den bisherigen Daten kommt das nicht vor; sollte es auftreten,
+ist manuelles Pruefen richtiger als eine geratene Verteilung.

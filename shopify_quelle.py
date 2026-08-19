@@ -28,6 +28,18 @@ from google.cloud import secretmanager
 
 LOG = logging.getLogger(__name__)
 
+
+class ShopifyGraphQLFehler(RuntimeError):
+    """Fachlicher Fehler aus der GraphQL-Antwort - mit auswertbaren Meldungen."""
+
+    def __init__(self, meldungen: list[dict[str, Any]]) -> None:
+        self.meldungen = meldungen
+        self.texte = [str(m.get("message", "")) for m in meldungen]
+        super().__init__("GraphQL-Fehler: " + " | ".join(self.texte))
+
+    def enthaelt(self, teiltext: str) -> bool:
+        return any(teiltext.lower() in t.lower() for t in self.texte)
+
 API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2026-01")
 
 BESTELLUNG_ABFRAGE = """
@@ -223,7 +235,7 @@ class ShopifyQuelle:
                 if gedrosselt:
                     time.sleep(2 ** versuch)
                     continue
-                raise RuntimeError(f"GraphQL-Fehler: {fehler_liste}")
+                raise ShopifyGraphQLFehler(fehler_liste)
 
             return ergebnis.get("data") or {}
 
