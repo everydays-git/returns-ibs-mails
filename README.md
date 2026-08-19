@@ -742,3 +742,44 @@ Kundenservice weiterhin in Shopify aus - der Knopf kommt in V2.
 **Faelle mit mehreren anteiligen Positionen** werden uebersprungen und
 gemeldet. In den bisherigen Daten kommt das nicht vor; sollte es auftreten,
 ist manuelles Pruefen richtiger als eine geratene Verteilung.
+
+---
+
+## Alarmierung
+
+Fuenf Jobs laufen unbeaufsichtigt. Ohne Alarm faellt ein Ausfall erst auf,
+wenn jemand nachsieht - oder wenn im Kundenservice Retouren fehlen.
+
+```bash
+bash alarmierung.sh simon@everydays.de
+```
+
+Das Skript legt Benachrichtigungskanal, log-basierte Metrik und Alarmrichtlinie
+an. Es ist wiederholbar: Vorhandenes wird aktualisiert statt verdoppelt.
+
+**Wichtig:** Google schickt eine Bestaetigungsmail an die angegebene Adresse.
+Ohne Bestaetigung kommen keine Benachrichtigungen an.
+
+### Worauf alarmiert wird
+
+Auf den Abbruch einer Jobausfuehrung. Einzelne Fehler *innerhalb* eines Laufs -
+etwa ein unlesbarer Beleg oder eine Bestellung ohne Treffer - loesen bewusst
+keinen Alarm aus. Die Jobs fangen sie ab, laufen weiter und protokollieren sie;
+sie gehoeren in den monatlichen Blick, nicht auf das Handy.
+
+### Testen
+
+```bash
+gcloud run jobs execute retouren-ingest --region $REGION --wait \
+  --args="--modus=unsinn"
+```
+
+Der ungueltige Modus laesst den Job mit Fehlercode enden. Innerhalb weniger
+Minuten sollte eine Mail eintreffen. Danach normal weiterarbeiten - der
+naechste planmaessige Lauf raeumt nichts auf, weil nichts geschrieben wurde.
+
+### Was der Alarm NICHT abdeckt
+
+Ein Job, der erfolgreich laeuft, aber nichts findet - etwa weil IBS keine Mails
+mehr schickt oder eine Weiterleitung ausgefallen ist. Das faellt nur ueber die
+Auswertung auf, nicht ueber den Alarm.
