@@ -8,6 +8,10 @@ smap-540 zweimal. Ein Filter auf aktive Produkte reicht nicht, weil bei
 protect-120 alle Varianten deaktiviert sind und die Stueckliste von
 protect-360 trotzdem darauf verweist. Deshalb ist die ArticleId der
 Schluessel, die SKU dient nur der Anzeige.
+
+Umsatzsteuer: VatIndex sagt, welcher der beiden Saetze gilt (1 oder 2).
+Netto ergibt sich als price / (1 + satz/100). Wird fuer die
+Liquiditaetsrechnung im Einkaufstool gebraucht.
 """
 
 from __future__ import annotations
@@ -117,6 +121,9 @@ def als_zeilen(produkte: list[dict[str, Any]], datum: str) -> list[dict[str, Any
             "is_deactivated": bool(p.get("IsDeactivated")),
             "cost_price": p.get("CostPrice"),
             "price": p.get("Price"),
+            "vat_index": int(p["VatIndex"]) if p.get("VatIndex") is not None else None,
+            "vat1_rate": p.get("Vat1Rate"),
+            "vat2_rate": p.get("Vat2Rate"),
             "bill_of_material": stueckliste,
         })
     return zeilen
