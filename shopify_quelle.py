@@ -59,6 +59,13 @@ query BestellungSuchen($suche: String!) {
       totalRefundedSet       { shopMoney { amount currencyCode } }
       customer { id defaultEmailAddress { emailAddress } firstName lastName }
       shippingAddress { name address1 address2 zip city countryCodeV2 }
+      displayFulfillmentStatus
+      fulfillments(first: 10) {
+        id
+        displayStatus
+        createdAt
+        trackingInfo { company number url }
+      }
       lineItems(first: 100) { edges { node {
         id sku title quantity currentQuantity refundableQuantity
         originalUnitPriceSet { shopMoney { amount } }
@@ -273,6 +280,30 @@ def betrag(geldfeld: dict[str, Any] | None) -> float | None:
         return None
     wert = (geldfeld.get("shopMoney") or {}).get("amount")
     return float(wert) if wert is not None else None
+
+
+def sendungen(bestellung: dict[str, Any]) -> list[dict[str, Any]]:
+    """Sendungsnummern mit Link zur Verfolgung.
+
+    Der Zustellstatus des Carriers ist ueber die Shopify-API NICHT verfuegbar -
+    geprueft an Bestellung #609598, wo DHL die Annahme als verweigert meldet,
+    Shopify aber FULFILLED und eine leere Ereignisliste liefert. Diesen Status
+    laedt die Shopify-Oberflaeche live nach.
+
+    Was wir mitgeben, ist deshalb der Direktlink: bei gescheiterten
+    Zustellungen spart er den Umweg ueber Shopify.
+    """
+    ergebnis = []
+    for f in bestellung.get("fulfillments") or []:
+        for t in f.get("trackingInfo") or []:
+            ergebnis.append({
+                "carrier": t.get("company"),
+                "sendungsnummer": t.get("number"),
+                "verfolgung_url": t.get("url"),
+                "status": f.get("displayStatus"),
+                "versendet_am": f.get("createdAt"),
+            })
+    return ergebnis
 
 
 def positionen(bestellung: dict[str, Any]) -> list[dict[str, Any]]:

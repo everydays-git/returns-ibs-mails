@@ -23,7 +23,7 @@ import uuid
 from google.cloud import bigquery
 
 import shopify_quelle
-from shopify_quelle import ShopifyQuelle, betrag, positionen
+from shopify_quelle import ShopifyQuelle, betrag, positionen, sendungen
 
 logging.basicConfig(
     level=logging.INFO,
@@ -211,6 +211,8 @@ def main() -> int:
                 "besteller_abweichend": abweichung,
                 "betragsvergleich": vergleich,
                 "positionen": pos,
+                "versandstatus": bestellung.get("displayFulfillmentStatus"),
+                "sendungen": sendungen(bestellung),
             },
             "enrichment_status": "ok",
         })
