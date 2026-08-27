@@ -54,8 +54,11 @@ def offene_faelle(client: bigquery.Client, projekt: str,
 
     sql = f"""
         SELECT l.receipt_id, c.channel, c.shopify_order_gid,
-               l.item_index, l.line_item_gid, l.pos_sku, l.pos_erstattbar,
-               l.stueck_je_pack, l.einheiten_erstattbar, l.erstattungsart
+               l.item_index, l.line_item_gid, l.pos_sku, l.pos_menge, l.pos_erstattbar,
+               l.stueck_je_pack, l.einheiten_erstattbar, l.erstattungsart,
+               (SELECT SAFE_CAST(JSON_VALUE(p, '$.effektiv_geschaetzt') AS FLOAT64)
+                FROM UNNEST(JSON_QUERY_ARRAY(c.order_snapshot, '$.positionen')) p
+                WHERE JSON_VALUE(p, '$.line_item_gid') = l.line_item_gid) AS positionswert
         FROM `{projekt}.{DATASET}.v_return_lines` l
         JOIN `{projekt}.{DATASET}.return_cases` c USING (receipt_id)
         WHERE l.einheiten_erstattbar > 0
@@ -76,7 +79,9 @@ def offene_faelle(client: bigquery.Client, projekt: str,
             "gid": z.line_item_gid,
             "sku": z.pos_sku,
             "stueck_je_pack": z.stueck_je_pack,
+            "pos_menge": z.pos_menge,
             "pos_erstattbar": z.pos_erstattbar,
+            "positionswert": z.positionswert,
             "einheiten": z.einheiten_erstattbar,
             "art": z.erstattungsart,
             "packungen": z.einheiten_erstattbar / z.stueck_je_pack,
@@ -155,29 +160,56 @@ def berechne(quelle: ShopifyQuelle, fall: dict) -> dict | None:
 
     betrag_anteil = 0.0
     betrag_packung = 0.0
+    teilweise_erstattet = False
     if anteilig:
         zeile = anteilig[0]
         vorschlag = _vorschlag(
             quelle, fall, [{"lineItemId": zeile["gid"], "quantity": 1}])
         if vorschlag:
             betrag_packung = betrag(vorschlag.get("amountSet")) or 0.0
-            betrag_anteil = round(betrag_packung * zeile["packungen"], 2)
             if maximal is None:
                 maximal = betrag(vorschlag.get("maximumRefundableSet"))
-            grundlage.append({
-                "art": "anteilige_position",
-                "sku": zeile["sku"],
-                "einheiten_zurueck": zeile["einheiten"],
-                "stueck_je_pack": zeile["stueck_je_pack"],
-                "anteil": round(zeile["packungen"], 4),
-                "betrag_je_packung": betrag_packung,
-                "betrag": betrag_anteil,
-            })
+
+            # Liegt Shopifys Wert je Packung unter dem Wert der Position aus
+            # der Momentaufnahme, wurde auf diese Position bereits erstattet.
+            # Shopify deckelt dann auf den Restbetrag - eine weitere
+            # Multiplikation mit dem Anteil wuerde ihn ein zweites Mal kuerzen.
+            erwartet = None
+            if zeile.get("positionswert") and zeile.get("pos_menge"):
+                erwartet = zeile["positionswert"] / zeile["pos_menge"]
+
+            if erwartet is not None and betrag_packung < erwartet - 0.01:
+                teilweise_erstattet = True
+                grundlage.append({
+                    "art": "anteilige_position_vorerstattet",
+                    "sku": zeile["sku"],
+                    "einheiten_zurueck": zeile["einheiten"],
+                    "stueck_je_pack": zeile["stueck_je_pack"],
+                    "positionswert": round(erwartet, 2),
+                    "noch_erstattbar": betrag_packung,
+                    "hinweis": ("Auf diese Position wurde bereits erstattet - "
+                                "kein anteiliger Vorschlag, bitte pruefen"),
+                })
+            else:
+                betrag_anteil = round(betrag_packung * zeile["packungen"], 2)
+                grundlage.append({
+                    "art": "anteilige_position",
+                    "sku": zeile["sku"],
+                    "einheiten_zurueck": zeile["einheiten"],
+                    "stueck_je_pack": zeile["stueck_je_pack"],
+                    "anteil": round(zeile["packungen"], 4),
+                    "betrag_je_packung": betrag_packung,
+                    "betrag": betrag_anteil,
+                })
 
     anteiliger_betrag = round(betrag_ganz + betrag_anteil, 2)
+    if teilweise_erstattet:
+        # Kein gerechneter Vorschlag - nur der Restbetrag als Information
+        anteiliger_betrag = None
     # "voll" heisst: die betroffene Packung ganz erstatten, nicht nur den
     # zurueckgesendeten Teil. Bei Kulanz ist das oft der richtige Wert.
-    voller_betrag = round(betrag_ganz + betrag_packung, 2) if anteilig else anteiliger_betrag
+    voller_betrag = (round(betrag_ganz + betrag_packung, 2)
+                     if anteilig else anteiliger_betrag)
 
     # Positionen koennen noch als erstattbar gelten, obwohl kein Geld mehr
     # offen ist - etwa nach einer Betragserstattung. Dann ist 0,00 richtig,
@@ -185,6 +217,8 @@ def berechne(quelle: ShopifyQuelle, fall: dict) -> dict | None:
     status = "offen"
     if maximal is not None and maximal <= 0:
         status = "bereits_erstattet"
+    elif teilweise_erstattet:
+        status = "teilweise_erstattet"
     elif anteiliger_betrag <= 0:
         status = "kein_betrag"
 
