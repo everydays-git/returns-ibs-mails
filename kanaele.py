@@ -17,8 +17,10 @@ import re
 MUSTER = [
     # everydays: #607165, optional mit Retourenfolge (_02 = zweite Retoure)
     (re.compile(r"^#\d{6}(_\d{2})?$"), "shopify_everydays"),
-    # growies: G4183 - muss vor dem DocMorris-Muster stehen
-    (re.compile(r"^G\d{3,6}(_\d{2})?$"), "shopify_growies"),
+    # growies: IBS liefert die Raute mit ("#G4183"). Verifiziert an 20 Belegen -
+    # keiner kam ohne Raute. Die Raute bleibt trotzdem optional, falls IBS
+    # die Schreibweise aendert.
+    (re.compile(r"^#?G\d{3,6}(_\d{2})?$", re.I), "shopify_growies"),
     (re.compile(r"^COM-", re.I), "shopapotheke"),
     (re.compile(r"^BG-\d+$", re.I), "b2b"),
     # IBS-interne Auftragsnummer – enthaelt KEINE Shopify-Bestellnummer.
