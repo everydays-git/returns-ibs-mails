@@ -48,11 +48,12 @@ def normalisiere(bestellnummer: str | None) -> str | None:
     return ref or None
 
 
-def retourenfolge(bestellnummer: str | None) -> int:
-    """Die wievielte Retoure zu diesem Auftrag - aus dem _NN-Suffix.
+def folgenummer(bestellnummer: str | None) -> int:
+    """Die Zahl aus dem _NN-Suffix der Auftragsnummer.
 
-    Ohne Suffix die erste. Relevant fuer den spaeteren Soll/Ist-Abgleich,
-    weil sich eine Ruecksendung ueber mehrere Belege verteilen kann.
+    Sie bezeichnet die Versendung, nicht die Retoure - bestaetigt am Fall
+    R619587_02, wo es eine Ruecksendung, aber zwei Versendungen gab. Nuetzlich
+    als Hinweis, dass zum selben Auftrag mehrfach versendet wurde.
     """
     treffer = re.search(r"_(\d{2})$", (bestellnummer or "").strip())
     return int(treffer.group(1)) if treffer else 1

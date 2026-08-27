@@ -44,12 +44,14 @@ def baue_fall(kopf: dict, positionen: list[dict], abgeschlossen: bool) -> dict:
     hinweise = []
     if kanal == "ibs_intern":
         hinweise.append(
-            "Auftragsnummer stammt aus IBS, nicht aus Shopify – "
-            "Bestellung muss manuell zugeordnet werden."
+            "Auftragsnummer stammt aus IBS, nicht aus Shopify. Zuordnung nur "
+            "ueber das IBS-Dashboard moeglich."
         )
-    folge = kanaele.retourenfolge(referenz)
+    folge = kanaele.folgenummer(referenz)
     if folge > 1:
-        hinweise.append(f"{folge}. Retoure zu diesem Auftrag.")
+        hinweise.append(
+            f"Auftragsnummer traegt das Suffix _{folge:02d} - zu diesem Auftrag "
+            "wurde mehrfach versendet.")
 
     return {
         "receipt_id": kopf["receipt_id"],
