@@ -47,6 +47,39 @@ DATASET = "returns"
 LOCATION = "EU"
 
 
+def materialisiere_zuordnung(client: bigquery.Client, projekt: str) -> None:
+    """Berechnet die Zuordnung einmal je Lauf und legt sie als Tabelle ab.
+
+    Die Views v_return_lines und v_case_zuordnung entpacken JSON, verknuepfen
+    Stuecklisten und rechnen mit Fensterfunktionen. BigQuery kann einen Filter
+    auf einen einzelnen Fall nicht in diese Berechnung hineinziehen - eine
+    Abfrage fuer EINEN Fall dauert deshalb genauso lange wie fuer alle
+    (gemessen: rund drei Sekunden). Fuer die App ist das zu langsam.
+
+    Die Tabellen sind genauso aktuell wie die Views: Ihre Eingangsdaten
+    aendern sich nur, wenn die vorgelagerten Jobs laufen. Dieser Job laeuft
+    als letzter in der Kette.
+    """
+    basis = f"{projekt}.{DATASET}"
+
+    client.query(f"""
+        CREATE OR REPLACE TABLE `{basis}.return_lines` AS
+        SELECT * FROM `{basis}.v_return_lines`
+    """).result()
+
+    client.query(f"""
+        CREATE OR REPLACE TABLE `{basis}.case_zuordnung` AS
+        SELECT * FROM `{basis}.v_case_zuordnung`
+    """).result()
+
+    anzahl = client.query(f"""
+        SELECT (SELECT COUNT(*) FROM `{basis}.return_lines`) AS zeilen,
+               (SELECT COUNT(*) FROM `{basis}.case_zuordnung`) AS faelle
+    """).result()
+    z = next(iter(anzahl))
+    LOG.info("Zuordnung materialisiert: %s Zeilen, %s Faelle", z.zeilen, z.faelle)
+
+
 def offene_faelle(client: bigquery.Client, projekt: str,
                   limit: int, erneut: bool) -> dict[str, dict]:
     """Faelle mit erstattbaren Einheiten, gruppiert je Beleg."""
@@ -59,7 +92,7 @@ def offene_faelle(client: bigquery.Client, projekt: str,
                (SELECT SAFE_CAST(JSON_VALUE(p, '$.effektiv_geschaetzt') AS FLOAT64)
                 FROM UNNEST(JSON_QUERY_ARRAY(c.order_snapshot, '$.positionen')) p
                 WHERE JSON_VALUE(p, '$.line_item_gid') = l.line_item_gid) AS positionswert
-        FROM `{projekt}.{DATASET}.v_return_lines` l
+        FROM `{projekt}.{DATASET}.return_lines` l
         JOIN `{projekt}.{DATASET}.return_cases` c USING (receipt_id)
         WHERE l.einheiten_erstattbar > 0
           AND l.line_item_gid IS NOT NULL
@@ -282,6 +315,11 @@ def main() -> int:
         return 1
 
     client = bigquery.Client(project=projekt, location=LOCATION)
+
+    # Zuerst die Zuordnung neu berechnen - der Job selbst liest sie danach,
+    # und die App bekommt eine fertige Tabelle statt einer teuren View.
+    materialisiere_zuordnung(client, projekt)
+
     faelle = offene_faelle(client, projekt, args.limit, args.erneut)
     LOG.info("Zu berechnen: %s Faelle", len(faelle))
     if not faelle:
