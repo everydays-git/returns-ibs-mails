@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+from typing import Iterator
 
 import kanaele
 from beleg_parser import parse
@@ -31,11 +32,50 @@ logging.basicConfig(
 LOG = logging.getLogger("retouren-ingest")
 
 
+# Kundenservice-Namen fuer die Zuweisung. Bewusst dieselben Namen wie in der
+# Signatur der Kundenemails - alle Bearbeiterinnen nutzen dieselbe
+# Retool-Anmeldung, ueber die liesse sich niemand unterscheiden.
+BEARBEITER = ["Clara Haller", "Mara Schmitz", "Sandra Becker"]
+
+
 def jetzt() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def baue_fall(kopf: dict, positionen: list[dict], abgeschlossen: bool) -> dict:
+def naechster_bearbeiter(client, projekt: str) -> "Iterator[str]":
+    """Vergibt neue Faelle reihum an die Bearbeiterinnen.
+
+    Setzt dort fort, wo der letzte Lauf aufgehoert hat. Ohne diesen Abgleich
+    wuerde jeder Lauf wieder beim ersten Namen beginnen - bei vier Laeufen
+    taeglich mit wenigen Belegen bekaeme die Erste deutlich mehr als die
+    anderen beiden.
+    """
+    sql = f"""
+        SELECT assignee, COUNT(*) AS anzahl
+        FROM `{projekt}.returns.return_cases`
+        WHERE assignee IN UNNEST(@namen)
+        GROUP BY 1
+    """
+    from google.cloud import bigquery as _bq
+    job = client.query(sql, job_config=_bq.QueryJobConfig(query_parameters=[
+        _bq.ArrayQueryParameter("namen", "STRING", BEARBEITER)
+    ]))
+    bestand = {z.assignee: z.anzahl for z in job.result()}
+    verteilt = [bestand.get(n, 0) for n in BEARBEITER]
+    LOG.info("Bisher zugewiesen: %s",
+             ", ".join(f"{n}: {a}" for n, a in zip(BEARBEITER, verteilt)))
+
+    # Beim Namen mit den wenigsten Faellen fortsetzen, damit ein
+    # unvollstaendiger vorheriger Durchgang nicht dauerhaft schieflaeuft.
+    start = verteilt.index(min(verteilt))
+    i = start
+    while True:
+        yield BEARBEITER[i % len(BEARBEITER)]
+        i += 1
+
+
+def baue_fall(kopf: dict, positionen: list[dict], abgeschlossen: bool,
+              bearbeiter: str | None = None) -> dict:
     referenz = kopf.get("order_reference_raw")
     kanal = kanaele.erkenne(referenz)
     zeitpunkt = jetzt()
@@ -62,6 +102,8 @@ def baue_fall(kopf: dict, positionen: list[dict], abgeschlossen: bool) -> dict:
         "internal_note": " ".join(hinweise) or None,
         "received_units": int(einheiten),
         "quantity_match": "unknown",
+        # Historische Faelle werden nicht zugewiesen - sie sind bereits erledigt.
+        "assignee": None if abgeschlossen else bearbeiter,
         "status": "abgeschlossen" if abgeschlossen else "offen",
         "resolution": "vor_tool_start" if abgeschlossen else None,
         "closed_at": zeitpunkt if abgeschlossen else None,
@@ -98,10 +140,13 @@ def main() -> int:
 
     ziel = None
     bekannt: set[str] = set()
+    reihum = None
     if not testlauf:
         ziel = BigQueryZiel(projekt)
         bekannt = ziel.vorhandene_receipt_ids(tage)
         LOG.info("Bereits erfasst im Zeitfenster: %s Belege", len(bekannt))
+        if not abgeschlossen:
+            reihum = naechster_bearbeiter(ziel._client, projekt)
 
     belege: list[dict] = []
     positionen: list[dict] = []
@@ -137,7 +182,9 @@ def main() -> int:
 
         belege.append(kopf)
         positionen.extend(ergebnis["positionen"])
-        faelle.append(baue_fall(kopf, ergebnis["positionen"], abgeschlossen))
+        zustaendig = next(reihum) if reihum is not None else None
+        faelle.append(baue_fall(kopf, ergebnis["positionen"], abgeschlossen,
+                                zustaendig))
 
     if testlauf:
         LOG.info("Testlauf beendet. Geprüft: %s, Fehler: %s",
