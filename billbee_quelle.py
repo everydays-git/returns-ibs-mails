@@ -8,10 +8,6 @@ smap-540 zweimal. Ein Filter auf aktive Produkte reicht nicht, weil bei
 protect-120 alle Varianten deaktiviert sind und die Stueckliste von
 protect-360 trotzdem darauf verweist. Deshalb ist die ArticleId der
 Schluessel, die SKU dient nur der Anzeige.
-
-Umsatzsteuer: VatIndex sagt, welcher der beiden Saetze gilt (1 oder 2).
-Netto ergibt sich als price / (1 + satz/100). Wird fuer die
-Liquiditaetsrechnung im Einkaufstool gebraucht.
 """
 
 from __future__ import annotations
@@ -29,6 +25,22 @@ from typing import Any
 from google.cloud import secretmanager
 
 LOG = logging.getLogger(__name__)
+
+# Netzwerkstoerungen, die KEINE HTTP-Antwort ergeben: Zeitueberschreitung,
+# abgebrochene Verbindung, DNS-Problem. Sie flogen bisher an den
+# Wiederholungsschleifen vorbei und haben den ganzen Job abgebrochen -
+# beobachtet am 23.09.2026, als Billbee nach 60 Sekunden nicht antwortete.
+VORUEBERGEHEND = (TimeoutError, urllib.error.URLError, ConnectionError, OSError)
+
+
+def ist_voruebergehend(fehler: BaseException) -> bool:
+    """HTTPError ist eine Unterklasse von URLError - die gehoert hier nicht her,
+    weil sie eine echte Antwort mit Statuscode darstellt und anderswo
+    behandelt wird."""
+    if isinstance(fehler, urllib.error.HTTPError):
+        return False
+    return isinstance(fehler, VORUEBERGEHEND)
+
 
 BASIS_URL = "https://app.billbee.io/api/v1"
 SEITENGROESSE = 250
@@ -97,6 +109,14 @@ def _abrufen(url: str, kopf: dict[str, str]) -> dict[str, Any]:
                 continue
             letzter = fehler.code
             time.sleep(2 ** versuch * 2)
+        except Exception as fehler:  # noqa: BLE001 - Auswahl unten
+            if not ist_voruebergehend(fehler):
+                raise
+            LOG.warning("Billbee nicht erreichbar (%s), Versuch %s von %s",
+                        type(fehler).__name__, versuch + 1, MAX_VERSUCHE)
+            time.sleep(2 ** versuch * 3)
+            letzter = type(fehler).__name__
+            continue
     raise RuntimeError(f"Billbee nicht erreichbar. Letzter Code: {letzter}")
 
 
@@ -121,9 +141,6 @@ def als_zeilen(produkte: list[dict[str, Any]], datum: str) -> list[dict[str, Any
             "is_deactivated": bool(p.get("IsDeactivated")),
             "cost_price": p.get("CostPrice"),
             "price": p.get("Price"),
-            "vat_index": int(p["VatIndex"]) if p.get("VatIndex") is not None else None,
-            "vat1_rate": p.get("Vat1Rate"),
-            "vat2_rate": p.get("Vat2Rate"),
             "bill_of_material": stueckliste,
         })
     return zeilen

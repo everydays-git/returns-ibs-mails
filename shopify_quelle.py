@@ -28,6 +28,22 @@ from google.cloud import secretmanager
 
 LOG = logging.getLogger(__name__)
 
+# Netzwerkstoerungen, die KEINE HTTP-Antwort ergeben: Zeitueberschreitung,
+# abgebrochene Verbindung, DNS-Problem. Sie flogen bisher an den
+# Wiederholungsschleifen vorbei und haben den ganzen Job abgebrochen -
+# beobachtet am 23.09.2026, als Billbee nach 60 Sekunden nicht antwortete.
+VORUEBERGEHEND = (TimeoutError, urllib.error.URLError, ConnectionError, OSError)
+
+
+def ist_voruebergehend(fehler: BaseException) -> bool:
+    """HTTPError ist eine Unterklasse von URLError - die gehoert hier nicht her,
+    weil sie eine echte Antwort mit Statuscode darstellt und anderswo
+    behandelt wird."""
+    if isinstance(fehler, urllib.error.HTTPError):
+        return False
+    return isinstance(fehler, VORUEBERGEHEND)
+
+
 
 class ShopifyGraphQLFehler(RuntimeError):
     """Fachlicher Fehler aus der GraphQL-Antwort - mit auswertbaren Meldungen."""
@@ -147,16 +163,28 @@ class ShopifyQuelle:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(anfrage, timeout=30) as antwort:
-                ergebnis = json.loads(antwort.read().decode("utf-8"))
-        except urllib.error.HTTPError as fehler:
-            hinweis = fehler.read().decode("utf-8", "replace")[:300]
+        ergebnis = None
+        for versuch in range(3):
+            try:
+                with urllib.request.urlopen(anfrage, timeout=30) as antwort:
+                    ergebnis = json.loads(antwort.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as fehler:
+                hinweis = fehler.read().decode("utf-8", "replace")[:300]
+                raise RuntimeError(
+                    f"Tokentausch fuer {shop.domain} fehlgeschlagen "
+                    f"(HTTP {fehler.code}): {hinweis}. "
+                    "Ist die App in diesem Shop installiert?"
+                ) from fehler
+            except Exception as fehler:  # noqa: BLE001 - Auswahl unten
+                if not ist_voruebergehend(fehler):
+                    raise
+                LOG.warning("Tokentausch %s nicht erreichbar (%s), Versuch %s von 3",
+                            shop.domain, type(fehler).__name__, versuch + 1)
+                time.sleep(2 ** versuch * 2)
+        if ergebnis is None:
             raise RuntimeError(
-                f"Tokentausch fuer {shop.domain} fehlgeschlagen "
-                f"(HTTP {fehler.code}): {hinweis}. "
-                "Ist die App in diesem Shop installiert?"
-            ) from fehler
+                f"Tokentausch fuer {shop.domain} nach drei Versuchen nicht erreichbar")
 
         token = ergebnis.get("access_token")
         if not token:
@@ -232,6 +260,13 @@ class ShopifyQuelle:
                         "Token oder Scopes pruefen."
                     ) from fehler
                 raise
+            except Exception as fehler:  # noqa: BLE001 - Auswahl unten
+                if not ist_voruebergehend(fehler):
+                    raise
+                LOG.warning("Shopify nicht erreichbar (%s), Versuch %s von 5",
+                            type(fehler).__name__, versuch + 1)
+                time.sleep(2 ** versuch * 2)
+                continue
 
             fehler_liste = ergebnis.get("errors")
             if fehler_liste:

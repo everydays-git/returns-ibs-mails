@@ -22,6 +22,22 @@ from google.cloud import secretmanager
 
 LOG = logging.getLogger(__name__)
 
+# Netzwerkstoerungen, die KEINE HTTP-Antwort ergeben: Zeitueberschreitung,
+# abgebrochene Verbindung, DNS-Problem. Sie flogen bisher an den
+# Wiederholungsschleifen vorbei und haben den ganzen Job abgebrochen -
+# beobachtet am 23.09.2026, als Billbee nach 60 Sekunden nicht antwortete.
+VORUEBERGEHEND = (TimeoutError, urllib.error.URLError, ConnectionError, OSError)
+
+
+def ist_voruebergehend(fehler: BaseException) -> bool:
+    """HTTPError ist eine Unterklasse von URLError - die gehoert hier nicht her,
+    weil sie eine echte Antwort mit Statuscode darstellt und anderswo
+    behandelt wird."""
+    if isinstance(fehler, urllib.error.HTTPError):
+        return False
+    return isinstance(fehler, VORUEBERGEHEND)
+
+
 BASIS_URL = "https://api.ibs-logistics.de/v1"
 LIMIT = 999          # bei rund 111 Artikeln genuegt ein Aufruf
 MAX_VERSUCHE = 4
@@ -58,6 +74,14 @@ def hole_artikel(projekt: str) -> list[dict[str, Any]]:
             letzter = fehler.code
             LOG.warning("IBS antwortet mit HTTP %s, Versuch %s", fehler.code, versuch + 1)
             time.sleep(2 ** versuch * 2)
+        except Exception as fehler:  # noqa: BLE001 - Auswahl unten
+            if not ist_voruebergehend(fehler):
+                raise
+            LOG.warning("IBS nicht erreichbar (%s), Versuch %s von %s",
+                        type(fehler).__name__, versuch + 1, MAX_VERSUCHE)
+            letzter = type(fehler).__name__
+            time.sleep(2 ** versuch * 2)
+            continue
     else:
         raise RuntimeError(f"IBS nicht erreichbar. Letzter Code: {letzter}")
 
