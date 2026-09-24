@@ -25,7 +25,7 @@ import uuid
 
 from google.cloud import bigquery
 
-from freshdesk_quelle import FreshdeskQuelle, waehle_ticket
+from freshdesk_quelle import ERLEDIGT, FreshdeskQuelle, waehle_ticket
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +41,12 @@ RUECKBLICK_TAGE = 120     # wie weit vor dem Wareneingang gesucht wird
 
 def offene_faelle(client: bigquery.Client, projekt: str,
                   limit: int, erneut: bool) -> list[dict]:
-    bedingung = "c.freshdesk_ticket_id IS NULL AND c.freshdesk_status IS NULL"
+    # Anker ist freshdesk_snapshot, nicht freshdesk_status: Bei einem Kunden
+    # ohne Ticket bleibt der Status leer, der Fall wuerde also bei jedem Lauf
+    # erneut gesucht. Der Schnappschuss wird dagegen immer geschrieben - auch
+    # mit dem Ergebnis "kein_ticket". Beim Sechs-Stunden-Takt fiel das nicht
+    # auf, stuendlich waren es 87 unnoetige Suchen je Lauf.
+    bedingung = "c.freshdesk_snapshot IS NULL"
     if erneut:
         bedingung = "c.freshdesk_ticket_id IS NULL"
 
@@ -101,6 +106,138 @@ def schreibe(client: bigquery.Client, projekt: str, zeilen: list[dict]) -> None:
     LOG.info("%s Faelle aktualisiert", len(zeilen))
 
 
+def aktualisiere_offene(client: bigquery.Client, projekt: str,
+                        quelle: FreshdeskQuelle, namen: dict[int, str]) -> dict[str, int]:
+    """Holt den aktuellen Ticketstand fuer nicht abgeschlossene Faelle.
+
+    Ohne das bleibt der gespeicherte Status auf dem Stand vom Zeitpunkt der
+    Verknuepfung stehen - eine Antwort des Kunden oder das Schliessen des
+    Tickets bekaemen wir nie mit.
+
+    Faelle, deren Ticket erledigt ist, werden automatisch geschlossen, wenn
+    zwei Bedingungen erfuellt sind:
+      1. Ueber das Tool ging eine Nachricht an den Kunden. Das belegt, dass
+         der Fall bearbeitet wurde - ein altes, laengst geschlossenes Ticket
+         soll keinen unbearbeiteten Fall schliessen.
+      2. Genau ein Retourenfall haengt an diesem Ticket. Bei Kunden mit zwei
+         Ruecksendungen kurz hintereinander zeigt unsere Ticketauswahl beide
+         auf dasselbe Ticket; dann waere unklar, welcher Fall erledigt ist.
+
+    Die Loesungsart bleibt leer. Sie laesst sich aus dem Ticketverlauf nicht
+    verlaesslich ableiten: Eine weitere Nachricht kann ebenso die Bestaetigung
+    einer Erstattung wie die Ankuendigung eines Neuversands sein.
+    """
+    sql = f"""
+        WITH mails AS (
+          SELECT receipt_id
+          FROM `{projekt}.{DATASET}.return_actions`
+          WHERE action_type = 'email_gesendet' AND success
+          GROUP BY 1
+        ),
+        belegung AS (
+          SELECT freshdesk_ticket_id, COUNT(*) AS faelle_am_ticket
+          FROM `{projekt}.{DATASET}.return_cases`
+          WHERE freshdesk_ticket_id IS NOT NULL
+          GROUP BY 1
+        )
+        SELECT c.receipt_id, c.freshdesk_ticket_id, c.freshdesk_status,
+               c.freshdesk_updated_at,
+               m.receipt_id IS NOT NULL AS mail_ueber_tool,
+               b.faelle_am_ticket
+        FROM `{projekt}.{DATASET}.return_cases` c
+        LEFT JOIN mails m USING (receipt_id)
+        LEFT JOIN belegung b ON b.freshdesk_ticket_id = c.freshdesk_ticket_id
+        WHERE c.status != 'abgeschlossen'
+          AND c.freshdesk_ticket_id IS NOT NULL
+    """
+    faelle = [dict(z) for z in client.query(sql).result()]
+    LOG.info("Ticketstand pruefen: %s offene Faelle", len(faelle))
+
+    zaehler = {"unveraendert": 0, "aktualisiert": 0,
+               "geschlossen": 0, "erledigt_ohne_automatik": 0, "fehler": 0}
+
+    for fall in faelle:
+        ticket_id = fall["freshdesk_ticket_id"]
+        try:
+            ticket = quelle.ticket(ticket_id)
+        except Exception as exc:  # noqa: BLE001 - ein Ticket darf den Lauf nicht kippen
+            LOG.error("Ticket %s nicht abrufbar: %s", ticket_id, exc)
+            zaehler["fehler"] += 1
+            continue
+
+        if not ticket:
+            zaehler["fehler"] += 1
+            continue
+
+        status_name = namen.get(ticket.get("status"), str(ticket.get("status")))
+        aktualisiert = ticket.get("updated_at")
+
+        if status_name == fall["freshdesk_status"]:
+            zaehler["unveraendert"] += 1
+        else:
+            client.query(f"""
+                UPDATE `{projekt}.{DATASET}.return_cases`
+                SET freshdesk_status = @status,
+                    freshdesk_updated_at = @aktualisiert,
+                    updated_at = CURRENT_TIMESTAMP(),
+                    updated_by = 'tickets'
+                WHERE receipt_id = @beleg
+            """, job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("status", "STRING", status_name),
+                bigquery.ScalarQueryParameter("aktualisiert", "TIMESTAMP", aktualisiert),
+                bigquery.ScalarQueryParameter("beleg", "STRING", fall["receipt_id"]),
+            ])).result()
+            LOG.info("Ticket %s: %s -> %s", ticket_id,
+                     fall["freshdesk_status"], status_name)
+            zaehler["aktualisiert"] += 1
+
+        if status_name not in ERLEDIGT:
+            continue
+
+        if not fall["mail_ueber_tool"] or (fall["faelle_am_ticket"] or 0) > 1:
+            grund = ("keine Nachricht ueber das Tool" if not fall["mail_ueber_tool"]
+                     else f"{fall['faelle_am_ticket']} Faelle an diesem Ticket")
+            LOG.info("Ticket %s erledigt, Fall %s bleibt offen (%s)",
+                     ticket_id, fall["receipt_id"], grund)
+            zaehler["erledigt_ohne_automatik"] += 1
+            continue
+
+        client.query(f"""
+            UPDATE `{projekt}.{DATASET}.return_cases`
+            SET status = 'abgeschlossen',
+                closed_at = CURRENT_TIMESTAMP(),
+                waiting_since = NULL,
+                updated_at = CURRENT_TIMESTAMP(),
+                updated_by = 'auto_ticket_geschlossen'
+            WHERE receipt_id = @beleg AND status != 'abgeschlossen'
+        """, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("beleg", "STRING", fall["receipt_id"]),
+        ])).result()
+
+        client.query(f"""
+            INSERT INTO `{projekt}.{DATASET}.return_actions`
+              (action_id, receipt_id, action_type, request_payload,
+               external_id, success, executed_by, executed_at)
+            VALUES (GENERATE_UUID(), @beleg, 'fall_auto_geschlossen',
+                    TO_JSON(STRUCT(@ticket AS ticket_id,
+                                   @status AS ticket_status,
+                                   'Ticket in Freshdesk erledigt' AS grund,
+                                   'Loesungsart nicht ableitbar' AS hinweis)),
+                    CAST(@ticket AS STRING), TRUE, 'System (Freshdesk-Abgleich)',
+                    CURRENT_TIMESTAMP())
+        """, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("beleg", "STRING", fall["receipt_id"]),
+            bigquery.ScalarQueryParameter("ticket", "INT64", ticket_id),
+            bigquery.ScalarQueryParameter("status", "STRING", status_name),
+        ])).result()
+
+        LOG.info("Fall %s automatisch geschlossen (Ticket %s: %s)",
+                 fall["receipt_id"], ticket_id, status_name)
+        zaehler["geschlossen"] += 1
+
+    return zaehler
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--modus", default="schreiben", choices=["test", "schreiben"])
@@ -111,13 +248,24 @@ def main() -> int:
     projekt = os.environ["GCP_PROJECT"]
     client = bigquery.Client(project=projekt, location=LOCATION)
 
+    quelle = FreshdeskQuelle(projekt)
+    namen = quelle.statusnamen()
+
+    # Zuerst den Stand der bereits verknuepften Tickets pruefen. Das muss VOR
+    # dem vorzeitigen Ausstieg stehen: Stuendlich gibt es meist nichts Neues
+    # zu verknuepfen, die Aktualisierung waere dann nie gelaufen.
+    if args.modus != "test":
+        stand = aktualisiere_offene(client, projekt, quelle, namen)
+        LOG.info("Ticketstand: %s aktualisiert, %s unveraendert, "
+                 "%s Faelle automatisch geschlossen, %s erledigt ohne Automatik, "
+                 "%s Fehler",
+                 stand["aktualisiert"], stand["unveraendert"], stand["geschlossen"],
+                 stand["erledigt_ohne_automatik"], stand["fehler"])
+
     faelle = offene_faelle(client, projekt, args.limit, args.erneut)
     LOG.info("Zu verknuepfen: %s Faelle", len(faelle))
     if not faelle:
         return 0
-
-    quelle = FreshdeskQuelle(projekt)
-    namen = quelle.statusnamen()
     lauf = str(uuid.uuid4())
 
     ergebnisse: list[dict] = []

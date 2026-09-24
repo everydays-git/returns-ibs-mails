@@ -141,6 +141,15 @@ class FreshdeskQuelle:
         self._cache[schluessel] = gefunden
         return gefunden
 
+    def ticket(self, ticket_id: int) -> dict[str, Any] | None:
+        """Aktueller Stand eines einzelnen Tickets.
+
+        Gebraucht, um bei offenen Faellen mitzubekommen, dass ein Ticket
+        geschlossen wurde oder der Kunde geantwortet hat. Die Verknuepfung
+        allein liefert nur den Stand vom Zeitpunkt der Zuordnung.
+        """
+        return self._abrufen(f"/api/v2/tickets/{ticket_id}")
+
     def unterhaltung(self, ticket_id: int) -> list[dict[str, Any]]:
         """Nachrichtenverlauf eines Tickets - Grundlage der spaeteren Extraktion."""
         return self._abrufen(f"/api/v2/tickets/{ticket_id}/conversations?per_page=50") or []
@@ -195,6 +204,12 @@ class FreshdeskQuelle:
                 time.sleep(2 ** versuch * 2)
                 continue
         raise RuntimeError(f"Freshdesk nicht erreichbar: {pfad}")
+
+
+# Freshdesk-Status, bei denen der Vorgang als erledigt gilt. Namen statt
+# Nummern, weil wir die Bezeichnungen speichern - "Gelöst & Happy" ist ein
+# eigener Status von everydays.
+ERLEDIGT = {"Resolved", "Closed", "Gelöst & Happy"}
 
 
 def waehle_ticket(tickets: list[dict[str, Any]],
