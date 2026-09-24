@@ -11,18 +11,55 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import socket
+import ssl
+import time
 from dataclasses import dataclass
 
 import google.auth
 from google.auth import iam
+from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 LOG = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+MAX_VERSUCHE = 4
+
+# Voruebergehende Stoerungen beim Zugriff auf Google. Bemerkenswert ist
+# RefreshError mit "unauthorized_client": Das klingt nach einem Rechteproblem,
+# trat aber am 24.09.2026 einmalig auf und war Sekunden spaeter verschwunden.
+# Die Domain-weite Delegation ist offenbar nicht immer sofort konsistent.
+# Ein echtes Rechteproblem wuerde bei allen Versuchen auftreten und nach
+# MAX_VERSUCHE weitergereicht - mit der urspruenglichen Meldung.
+VORUEBERGEHEND = (RefreshError, TransportError, TimeoutError,
+                  socket.timeout, ssl.SSLError, ConnectionError, OSError)
+
+
+def mit_wiederholung(beschreibung: str, aufruf):
+    """Fuehrt einen Google-Aufruf aus und wiederholt ihn bei Stoerungen."""
+    for versuch in range(MAX_VERSUCHE):
+        try:
+            return aufruf()
+        except HttpError as fehler:
+            code = getattr(fehler.resp, "status", None)
+            if code not in (429, 500, 502, 503, 504):
+                raise
+            LOG.warning("%s: HTTP %s, Versuch %s von %s",
+                        beschreibung, code, versuch + 1, MAX_VERSUCHE)
+        except VORUEBERGEHEND as fehler:
+            if versuch == MAX_VERSUCHE - 1:
+                raise
+            LOG.warning("%s: %s, Versuch %s von %s",
+                        beschreibung, type(fehler).__name__,
+                        versuch + 1, MAX_VERSUCHE)
+        time.sleep(2 ** versuch * 2)
+    raise RuntimeError(f"{beschreibung}: nach {MAX_VERSUCHE} Versuchen erfolglos")
 
 
 @dataclass
@@ -91,11 +128,12 @@ class GmailQuelle:
         ids: list[str] = []
         seite = None
         while len(ids) < limit:
-            antwort = (
-                self._api.users()
+            antwort = mit_wiederholung(
+                "Gmail-Suche",
+                lambda s=seite: self._api.users()
                 .messages()
-                .list(userId="me", q=query, pageToken=seite, maxResults=100)
-                .execute()
+                .list(userId="me", q=query, pageToken=s, maxResults=100)
+                .execute(),
             )
             for m in antwort.get("messages", []):
                 ids.append(m["id"])
@@ -108,11 +146,12 @@ class GmailQuelle:
 
     def hole(self, message_id: str) -> Nachricht:
         """Lädt eine Mail samt erstem Excel-Anhang."""
-        nachricht = (
-            self._api.users()
+        nachricht = mit_wiederholung(
+            f"Mail {message_id} laden",
+            lambda: self._api.users()
             .messages()
             .get(userId="me", id=message_id, format="full")
-            .execute()
+            .execute(),
         )
 
         kopfzeilen = {
@@ -138,8 +177,9 @@ class GmailQuelle:
 
         if dateiname.lower().endswith((".xls", ".xlsx")):
             if koerper.get("attachmentId"):
-                daten = (
-                    self._api.users()
+                daten = mit_wiederholung(
+                    f"Anhang zu {message_id} laden",
+                    lambda: self._api.users()
                     .messages()
                     .attachments()
                     .get(
@@ -147,7 +187,7 @@ class GmailQuelle:
                         messageId=message_id,
                         id=koerper["attachmentId"],
                     )
-                    .execute()
+                    .execute(),
                 )
                 roh = base64.urlsafe_b64decode(daten["data"])
             elif koerper.get("data"):
